@@ -60,7 +60,7 @@ def probe(path):
         [tool("ffprobe"), "-v", "error", "-print_format", "json", "-show_format", "-show_streams", str(path)],
         capture_output=True, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
     if out.returncode != 0:
-        raise RuntimeError("Could not read this video file: " + out.stderr.strip()[-300:])
+        raise RuntimeError("This file could not be read as a video. It may be damaged or not a video file.")
     info = json.loads(out.stdout)
     v = next((s for s in info["streams"] if s["codec_type"] == "video"
               and s.get("disposition", {}).get("attached_pic", 0) == 0), None)
@@ -141,7 +141,8 @@ def list_projects():
         items = sorted(_projects.values(), key=lambda p: p["created"], reverse=True)
         return [{k: p.get(k) for k in ("id", "title", "status", "progress", "message", "created", "duration")}
                 | {"clips": len(p.get("clips", [])),
-                   "thumb": p["clips"][0]["id"] if p.get("clips") else None} for p in items]
+                   "thumb": next((c["id"] for c in p.get("clips", []) if c["render"]["status"] == "done"), None)}
+                for p in items]
 
 
 def get(pid):
@@ -185,6 +186,12 @@ def delete_project(pid):
     with _lock:
         _projects.pop(pid, None)
     shutil.rmtree(pdir(pid), ignore_errors=True)
+    leftover = pdir(pid) / "project.json"  # a file still open elsewhere can block the delete on Windows
+    if leftover.exists():
+        try:
+            leftover.unlink()
+        except OSError:
+            pass
 
 
 def _status(p, status, message, progress=0.0):
@@ -457,8 +464,12 @@ def _merge(dst, patch, allowed):
 
 def update_clip(pid, cid, patch):
     p = get(pid)
+    if not isinstance(patch, dict):
+        raise ValueError("Expected an object of clip settings")
     with _lock:
-        c = get_clip(p, cid)
+        live = get_clip(p, cid)
+        c = json.loads(json.dumps(live))  # edit a copy so a bad value cannot leave the clip half-changed
+        c["render"] = live["render"]
         before = (c["start"], c["end"], c["subtitles"]["words_per"])
         _merge(c, patch, ("title", "start", "end", "framing", "pan_x", "pan_y", "zoom", "speed", "volume"))
         if isinstance(patch.get("subtitles"), dict):
@@ -474,7 +485,23 @@ def update_clip(pid, cid, patch):
         c["pan_y"] = max(0.0, min(1.0, float(c["pan_y"])))
         if c["framing"] not in ("crop", "blur", "fit"):
             c["framing"] = "crop"
-        c["subtitles"]["words_per"] = max(1, min(8, int(c["subtitles"]["words_per"])))
+        c["title"] = str(c["title"])[:200]
+        sub, ttl = c["subtitles"], c["title_overlay"]
+        if sub["font"] not in FONTS:
+            sub["font"] = "Arial Black"
+        sub["words_per"] = max(1, min(8, int(sub["words_per"])))
+        sub["size"] = max(20, min(240, int(float(sub["size"]))))
+        sub["outline"] = max(0.0, min(20.0, float(sub["outline"])))
+        sub["pos_y"] = max(0.0, min(100.0, float(sub["pos_y"])))
+        ttl["size"] = max(20, min(240, int(float(ttl["size"]))))
+        ttl["pos_y"] = max(0.0, min(100.0, float(ttl["pos_y"])))
+        ttl["duration"] = max(0.0, float(ttl["duration"] or 0))
+        ttl["text"] = str(ttl["text"])
+        for owner, key in ((sub, "color"), (sub, "highlight"), (ttl, "color")):
+            if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(owner[key])):
+                raise ValueError(f"{key} must be a colour like #FFE600")
+        for owner, key in ((sub, "enabled"), (sub, "highlight_on"), (sub, "uppercase"), (ttl, "enabled")):
+            owner[key] = bool(owner[key])
         if isinstance(patch.get("captions"), list):
             c["captions"] = [_clean_caption(x) for x in patch["captions"] if str(x.get("text", "")).strip()]
             c["captions_edited"] = True
@@ -485,6 +512,7 @@ def update_clip(pid, cid, patch):
             c["captions"] = build_captions(transcript(pid)["words"], c["start"], c["end"],
                                            c["subtitles"]["words_per"])
         c["render"]["stale"] = True
+        p["clips"][p["clips"].index(live)] = c
         save(p)
         return c
 
@@ -650,7 +678,8 @@ def render_clip(pid, cid):
                         "-vf", "scale=360:-2", "-q:v", "4", f"{cid}.jpg"], cwd=str(out_dir))
         except Exception:
             pass
-        same = all(snap[k] == c[k] for k in snap if k != "render")
+        cur = next((x for x in p["clips"] if x["id"] == cid), None)  # the clip may have been edited meanwhile
+        same = cur is not None and all(snap[k] == cur[k] for k in snap if k != "render")
         r.update(status="done", progress=1, file=f"clips/{cid}.mp4", stale=not same, version=int(time.time()))
     except Exception as e:
         traceback.print_exc()
@@ -691,6 +720,10 @@ def run_pipeline(pid, url=None, raw=None):
     except Exception as e:
         traceback.print_exc()
         msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e))
+        if url and type(e).__module__.startswith("yt_dlp"):
+            msg = ("Could not download a video from this link. Check that it opens in your browser and is public "
+                   "(private, age-restricted and region-locked videos cannot be downloaded). Details: "
+                   + msg.replace("ERROR: ", "")[:240])
         _status(p, "error", msg[-500:] or "Something went wrong")
 
 

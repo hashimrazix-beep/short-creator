@@ -22,6 +22,12 @@ from pathlib import Path
 
 import engine
 
+for _stream in (sys.stdout, sys.stderr):  # titles can contain emoji; never crash on a legacy console code page
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 BASE = f"http://127.0.0.1:{engine.config()['port']}/api"
 
 

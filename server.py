@@ -96,6 +96,8 @@ def project_repick(pid: str, body: dict = Body(default={})):
 
 @app.post("/api/projects/{pid}/clips")
 def clip_add(pid: str, body: dict = Body(...)):
+    if "start" not in body or "end" not in body:
+        raise HTTPException(400, "start and end (seconds) are required")
     return engine.add_clip(pid, body["start"], body["end"], body.get("title"))
 
 
@@ -154,7 +156,14 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 if __name__ == "__main__":
     import sys
+    import socket
     port = engine.config()["port"]
+    with socket.socket() as s:  # already running? just open it instead of failing on the busy port
+        if s.connect_ex(("127.0.0.1", port)) == 0:
+            print(f"Short Creator is already running at http://localhost:{port}")
+            if "--no-browser" not in sys.argv:
+                webbrowser.open(f"http://localhost:{port}")
+            sys.exit(0)
     if "--no-browser" not in sys.argv:
         threading.Timer(1.2, lambda: webbrowser.open(f"http://localhost:{port}")).start()
     print(f"\n  Short Creator is running:  http://localhost:{port}\n  Close this window to stop it.\n")
